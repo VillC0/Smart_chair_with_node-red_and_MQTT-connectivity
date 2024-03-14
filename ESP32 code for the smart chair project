@@ -1,0 +1,182 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "Adafruit_CCS811.h"
+#include <NewPing.h>
+
+#define TRIGGER_PIN 5 // Pin connected to the trigger of the ultrasonic sensor
+#define ECHO_PIN 18   // Pin connected to the echo of the ultrasonic sensor
+
+const int BUTTON_PIN = 4;        // the number of the pushbutton pin
+const int LONG_PRESS_TIME = 1000; // 1000 milliseconds
+const int REMINDER_INTERVAL = 60000; // 60000 milliseconds = 60 seconds
+
+Adafruit_CCS811 ccs;
+
+NewPing sonar(TRIGGER_PIN, ECHO_PIN);
+unsigned long distanceStartTime = 0;
+const unsigned long distanceThreshold = 100; // 100 cm (1 meter) distance threshold
+const unsigned long alarmThreshold = 60000; // 60 seconds in milliseconds
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+long lastMsg = 0;
+char msg[50];
+int value = 0;
+
+int lastState = HIGH;          // the previous state from the input pin
+int currentState;              // the current reading from the input pin
+unsigned long pressedTime = 0; // the time the button was pressed
+unsigned long releasedTime = 0;
+unsigned long reminderTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  delay(1000); // time to bring up serial monitor
+
+  Serial.println("CCS811 test");
+  if (!ccs.begin()) {
+    Serial.println("Failed to start sensor! Please check your wiring");
+    while (1);
+  }
+  // Wait for the sensor to be ready
+  while (!ccs.available());
+
+  setup_wifi();
+  client.setServer("test.mosquitto.org", 1883); // Change this to your MQTT broker IP address
+  client.setCallback(callback);
+}
+
+void setup_wifi() {
+  delay(100);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println("YOUR_WIFI_SSID");
+
+  WiFi.begin("YOUR_WIFI_SSID", "YOUR_WIFI_PASSWORD"); // Change these to your WiFi SSID and password
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void callback(char *topic, byte *message, unsigned int length) {
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  String messageTemp;
+
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)message[i]);
+    messageTemp += (char)message[i];
+  }
+  Serial.println();
+
+  if (String(topic) == "esp32/haaga/output") {
+    Serial.print("Changing output to ");
+    if (messageTemp == "on") {
+      Serial.println("on");
+      // Your code to turn on the LED or take any action
+    } else if (messageTemp == "off") {
+      Serial.println("off");
+      // Your code to turn off the LED or take any action
+    }
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32ClientHaaga")) {
+      Serial.println("connected");
+      client.subscribe("esp32/haaga/output");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  // Distance measurement
+  unsigned int distance = sonar.ping_cm();
+
+  if (distance < distanceThreshold) {
+    // Person detected within 1 meter
+    Serial.println("Person detected");
+    client.publish("esp32/haaga/distance", "Person detected within 1 meter");
+    if (distanceStartTime == 0) {
+      // Start counting time
+      distanceStartTime = millis();
+    }
+    // Check if one minute has passed
+    if (millis() - distanceStartTime >= alarmThreshold) {
+      // Print "Get up" to the serial monitor
+      Serial.println("Get up");
+      client.publish("esp32/haaga/alert", "Get up!");
+
+      // Reset distance start time
+      distanceStartTime = 0;
+    }
+  } else {
+    // No person detected or person is beyond 1 meter
+    Serial.println("No person detected");
+    client.publish("esp32/haaga/distance", "No person detected or person is beyond 1 meter");
+    // Reset distance start time
+    distanceStartTime = 0;
+  }
+
+  // CCS811 measurements
+  if (ccs.available()) {
+    if (!ccs.readData()) {
+      Serial.print("CO2: ");
+      Serial.print(ccs.geteCO2());
+      Serial.print("ppm, TVOC: ");
+      Serial.println(ccs.getTVOC());
+      client.publish("esp32/haaga/CO2", String(ccs.geteCO2()).c_str());
+      client.publish("esp32/haaga/TVOC", String(ccs.getTVOC()).c_str());
+    } else {
+      Serial.println("ERROR!");
+      while (1);
+    }
+
+    // Button press measurements
+    currentState = digitalRead(BUTTON_PIN);
+
+    if (lastState == HIGH && currentState == LOW) { // button is pressed
+      pressedTime = millis();
+      Serial.println("A person is sitting");
+      client.publish("esp32/haaga/button", "A person is sitting");
+    }
+
+    if (lastState == LOW && currentState == HIGH) { // button is released
+      releasedTime = millis();
+      Serial.println("No one is sitting");
+      client.publish("esp32/haaga/button", "No one is sitting");
+    }
+    if (currentState == LOW && millis() - pressedTime >= REMINDER_INTERVAL && millis() - reminderTime >= REMINDER_INTERVAL) {
+      Serial.println("Get up");
+      client.publish("esp32/haaga/button", "Get up");
+      reminderTime = millis();
+    }
+
+    lastState = currentState; // save the last state
+  }
+}
+
+// Within all of the client.publish command lines as well as the client.subscribe command line, change the topic names to ones that work for you,
+// for example, change esp32/haaga/button to something like bme280/HomeAssistant/temperature if that is what you are working on. The topic name
+// is just used to identify which data streams you subscribe/publish to.
